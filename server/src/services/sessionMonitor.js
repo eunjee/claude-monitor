@@ -1,0 +1,314 @@
+import fs from 'fs';
+import path from 'path';
+import chokidar from 'chokidar';
+import { SESSIONS_DIR, PROJECTS_DIR, projectCache, isProcessRunning } from './projectScanner.js';
+import { parseSessionIncremental } from './jsonlParser.js';
+
+const IDLE_THRESHOLD_MS = 120_000;
+const POLL_INTERVAL_MS = 15_000;
+const DEBOUNCE_MS = 500;
+
+const sseClients = new Set();
+const activeSessions = new Map();
+const jsonlWatchers = new Map();
+const debounceTimers = new Map();
+
+let sessionsWatcher = null;
+let pollTimer = null;
+
+export async function initWatcher() {
+  await bootstrapActiveSessions();
+
+  sessionsWatcher = chokidar.watch(path.join(SESSIONS_DIR, '*.json'), {
+    ignoreInitial: true,
+    persistent: true,
+  });
+
+  sessionsWatcher.on('add', (fp) => handleSessionFile(fp));
+  sessionsWatcher.on('change', (fp) => handleSessionFile(fp));
+  sessionsWatcher.on('unlink', (fp) => handleSessionFileRemoved(fp));
+
+  pollTimer = setInterval(pollSessionStatus, POLL_INTERVAL_MS);
+  console.log(`Session monitor started. Tracking ${activeSessions.size} active sessions.`);
+}
+
+async function bootstrapActiveSessions() {
+  let files;
+  try { files = fs.readdirSync(SESSIONS_DIR); }
+  catch { return; }
+
+  for (const file of files) {
+    if (!file.endsWith('.json')) continue;
+    await handleSessionFile(path.join(SESSIONS_DIR, file));
+  }
+}
+
+async function handleSessionFile(filePath) {
+  let content;
+  try {
+    content = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  } catch { return; }
+
+  const { pid, sessionId, cwd, startedAt } = content;
+  if (!pid || !sessionId) return;
+
+  if (!isProcessRunning(pid)) {
+    markCompleted(sessionId);
+    return;
+  }
+
+  if (activeSessions.has(sessionId)) return;
+
+  let projectDir = findProjectDir(cwd);
+  const jsonlPath = findJsonlPath(projectDir, sessionId);
+
+  if (!projectDir && jsonlPath) {
+    const parent = path.basename(path.dirname(jsonlPath));
+    projectDir = parent;
+  }
+
+  const project = projectDir ? projectCache.get(projectDir) : null;
+
+  const session = {
+    sessionId,
+    pid,
+    projectDir: projectDir || '',
+    projectLabel: project?.label || extractLastSegment(cwd),
+    status: 'active',
+    startedAt: startedAt || Date.now(),
+    firstPrompt: '',
+    lastPrompt: '',
+    lastActivity: jsonlPath ? getFileMtime(jsonlPath) : Date.now(),
+    tokens: { totalInput: 0, totalOutput: 0 },
+    toolCallCount: 0,
+    model: null,
+    jsonlPath,
+    lastOffset: 0,
+  };
+
+  activeSessions.set(sessionId, session);
+
+  if (jsonlPath) {
+    await parseAndUpdate(sessionId);
+    watchJsonl(sessionId, jsonlPath);
+  }
+
+  broadcast('update', toClientData(session));
+}
+
+function handleSessionFileRemoved(filePath) {
+  const pidStr = path.basename(filePath, '.json');
+  for (const [sessionId, session] of activeSessions) {
+    if (String(session.pid) === pidStr) {
+      markCompleted(sessionId);
+      break;
+    }
+  }
+}
+
+function markCompleted(sessionId) {
+  const session = activeSessions.get(sessionId);
+  if (!session) return;
+
+  if (session.status === 'completed') return;
+  session.status = 'completed';
+  unwatchJsonl(sessionId);
+  broadcast('update', toClientData(session));
+}
+
+function watchJsonl(sessionId, jsonlPath) {
+  if (jsonlWatchers.has(sessionId)) return;
+
+  const watcher = chokidar.watch(jsonlPath, {
+    ignoreInitial: true,
+    persistent: true,
+  });
+
+  watcher.on('change', () => {
+    debouncedParse(sessionId);
+  });
+
+  jsonlWatchers.set(sessionId, watcher);
+}
+
+function unwatchJsonl(sessionId) {
+  const watcher = jsonlWatchers.get(sessionId);
+  if (watcher) {
+    watcher.close();
+    jsonlWatchers.delete(sessionId);
+  }
+  const timer = debounceTimers.get(sessionId);
+  if (timer) {
+    clearTimeout(timer);
+    debounceTimers.delete(sessionId);
+  }
+}
+
+function debouncedParse(sessionId) {
+  const existing = debounceTimers.get(sessionId);
+  if (existing) clearTimeout(existing);
+
+  debounceTimers.set(sessionId, setTimeout(async () => {
+    debounceTimers.delete(sessionId);
+    await parseAndUpdate(sessionId);
+  }, DEBOUNCE_MS));
+}
+
+async function parseAndUpdate(sessionId) {
+  const session = activeSessions.get(sessionId);
+  if (!session || !session.jsonlPath) return;
+
+  try {
+    if (!fs.existsSync(session.jsonlPath)) return;
+
+    const { state, newOffset } = await parseSessionIncremental(
+      session.jsonlPath,
+      session.lastOffset,
+      session.lastOffset > 0 ? {
+        sessionId: session.sessionId,
+        model: session.model,
+        startedAt: session.startedAt,
+        endedAt: null,
+        firstPrompt: session.firstPrompt,
+        lastPrompt: session.lastPrompt,
+        tokens: { ...session.tokens },
+        toolCallCount: session.toolCallCount,
+      } : null
+    );
+
+    session.lastOffset = newOffset;
+    if (state.model) session.model = state.model;
+    if (state.firstPrompt) session.firstPrompt = state.firstPrompt;
+    if (state.lastPrompt) session.lastPrompt = state.lastPrompt;
+    session.tokens = state.tokens;
+    session.toolCallCount = state.toolCallCount || 0;
+    if (state.startedAt && !session.startedAt) session.startedAt = state.startedAt;
+
+    session.lastActivity = getFileMtime(session.jsonlPath);
+    const timeSince = Date.now() - session.lastActivity;
+    session.status = timeSince > IDLE_THRESHOLD_MS ? 'idle' : 'active';
+
+    broadcast('update', toClientData(session));
+  } catch { /* skip parse errors */ }
+}
+
+function pollSessionStatus() {
+  const now = Date.now();
+  for (const [sessionId, session] of activeSessions) {
+    if (session.status === 'completed') continue;
+
+    if (!isProcessRunning(session.pid)) {
+      markCompleted(sessionId);
+      continue;
+    }
+
+    const timeSinceActivity = now - session.lastActivity;
+    const newStatus = timeSinceActivity > IDLE_THRESHOLD_MS ? 'idle' : 'active';
+
+    if (session.status !== newStatus) {
+      session.status = newStatus;
+      broadcast('update', toClientData(session));
+    }
+
+    if (!session.jsonlPath) {
+      const jsonlPath = findJsonlPath(session.projectDir, sessionId);
+      if (jsonlPath) {
+        session.jsonlPath = jsonlPath;
+        parseAndUpdate(sessionId);
+        watchJsonl(sessionId, jsonlPath);
+      }
+    }
+  }
+}
+
+function findProjectDir(cwd) {
+  if (!cwd) return null;
+  const normalized = cwd.replace(/\\/g, '/');
+
+  for (const [dirName, info] of projectCache) {
+    if (info.path && info.path.replace(/\\/g, '/') === normalized) {
+      return dirName;
+    }
+  }
+
+  try {
+    const dirs = fs.readdirSync(PROJECTS_DIR).filter((d) => {
+      try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory(); }
+      catch { return false; }
+    });
+    for (const dir of dirs) {
+      const decoded = dir.replace(/^([A-Z])-/, '$1:').replace(/-/g, '/');
+      if (decoded === normalized || decoded === cwd.replace(/\\/g, '/')) {
+        return dir;
+      }
+    }
+  } catch { /* skip */ }
+
+  return null;
+}
+
+function findJsonlPath(projectDir, sessionId) {
+  if (!projectDir) {
+    try {
+      const dirs = fs.readdirSync(PROJECTS_DIR);
+      for (const dir of dirs) {
+        const candidate = path.join(PROJECTS_DIR, dir, `${sessionId}.jsonl`);
+        if (fs.existsSync(candidate)) return candidate;
+      }
+    } catch { /* skip */ }
+    return null;
+  }
+  const candidate = path.join(PROJECTS_DIR, projectDir, `${sessionId}.jsonl`);
+  try {
+    if (fs.existsSync(candidate)) return candidate;
+  } catch { /* skip */ }
+  return null;
+}
+
+function getFileMtime(filePath) {
+  try { return fs.statSync(filePath).mtimeMs; }
+  catch { return Date.now(); }
+}
+
+function extractLastSegment(str) {
+  if (!str) return 'unknown';
+  const normalized = str.replace(/\\/g, '/');
+  const segments = normalized.split('/').filter(Boolean);
+  return segments[segments.length - 1] || 'unknown';
+}
+
+function toClientData(session) {
+  return {
+    sessionId: session.sessionId,
+    pid: session.pid,
+    projectDir: session.projectDir,
+    projectLabel: session.projectLabel,
+    status: session.status,
+    startedAt: session.startedAt,
+    firstPrompt: session.firstPrompt,
+    lastPrompt: session.lastPrompt,
+    lastActivity: session.lastActivity,
+    tokens: session.tokens,
+    toolCallCount: session.toolCallCount,
+    model: session.model,
+  };
+}
+
+export function getMonitorSnapshot() {
+  return [...activeSessions.values()].map(toClientData);
+}
+
+export function addSSEClient(res) {
+  sseClients.add(res);
+}
+
+export function removeSSEClient(res) {
+  sseClients.delete(res);
+}
+
+function broadcast(event, data) {
+  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) {
+    try { client.write(msg); } catch { sseClients.delete(client); }
+  }
+}

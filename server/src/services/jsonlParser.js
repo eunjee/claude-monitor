@@ -213,8 +213,9 @@ function processRecordLive(record, state) {
   }
   if (record.sessionId && !state.sessionId) state.sessionId = record.sessionId;
 
-  if (record.type === 'user') {
+  if (record.type === 'user' && !record.isMeta) {
     processUserRecord(record, state);
+    state.lastRecordHint = 'user_input';
   } else if (record.type === 'assistant') {
     const msg = record.message;
     if (!msg) return;
@@ -223,10 +224,23 @@ function processRecordLive(record, state) {
       state.tokens.totalInput += msg.usage.input_tokens || 0;
       state.tokens.totalOutput += msg.usage.output_tokens || 0;
     }
-    if (Array.isArray(msg.content)) {
-      for (const block of msg.content) {
-        if (block.type === 'tool_use') state.toolCallCount = (state.toolCallCount || 0) + 1;
+    const toolUseBlocks = Array.isArray(msg.content) ? msg.content.filter(b => b.type === 'tool_use') : [];
+    if (toolUseBlocks.length > 0) {
+      for (const block of toolUseBlocks) {
+        state.toolCallCount = (state.toolCallCount || 0) + 1;
       }
+      const lastTool = toolUseBlocks[toolUseBlocks.length - 1];
+      state.lastRecordHint = 'tool_use';
+      state.lastToolName = lastTool.name || null;
+      state.lastToolInput = summarizeToolInput(lastTool.name, lastTool.input) || null;
+    } else {
+      state.lastRecordHint = 'assistant_end';
+    }
+  } else if (record.type === 'system') {
+    if (record.subtype === 'turn_duration' || record.subtype === 'stop_hook_summary') {
+      state.lastRecordHint = 'turn_ended';
+      state.lastToolName = null;
+      state.lastToolInput = null;
     }
   }
 }

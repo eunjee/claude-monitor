@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import chokidar from 'chokidar';
-import { SESSIONS_DIR, PROJECTS_DIR, projectCache, isProcessRunning } from './projectScanner.js';
+import { SESSIONS_DIR, PROJECTS_DIR, projectCache, isProcessRunning, getProjects } from './projectScanner.js';
 import { parseSessionIncremental } from './jsonlParser.js';
 
 const IDLE_THRESHOLD_MS = 120_000;
@@ -17,6 +17,7 @@ let sessionsWatcher = null;
 let pollTimer = null;
 
 export async function initWatcher() {
+  if (projectCache.size === 0) await getProjects();
   await bootstrapActiveSessions();
 
   sessionsWatcher = chokidar.watch(path.join(SESSIONS_DIR, '*.json'), {
@@ -60,11 +61,22 @@ async function handleSessionFile(filePath) {
   if (activeSessions.has(sessionId)) return;
 
   let projectDir = findProjectDir(cwd);
-  const jsonlPath = findJsonlPath(projectDir, sessionId);
+  let jsonlPath = findJsonlPath(projectDir, sessionId);
 
   if (!projectDir && jsonlPath) {
     const parent = path.basename(path.dirname(jsonlPath));
     projectDir = parent;
+  }
+
+  if (projectDir) {
+    const latestJsonl = findLatestJsonlInProject(projectDir);
+    if (latestJsonl) {
+      const latestMtime = getFileMtime(latestJsonl);
+      const currentMtime = jsonlPath ? getFileMtime(jsonlPath) : 0;
+      if (latestMtime > currentMtime) {
+        jsonlPath = latestJsonl;
+      }
+    }
   }
 
   const project = projectDir ? projectCache.get(projectDir) : null;
@@ -183,6 +195,9 @@ async function parseAndUpdate(sessionId) {
     session.tokens = state.tokens;
     session.toolCallCount = state.toolCallCount || 0;
     if (state.startedAt && !session.startedAt) session.startedAt = state.startedAt;
+    if (state.lastRecordHint) session.lastRecordHint = state.lastRecordHint;
+    if (state.lastToolName) session.lastToolName = state.lastToolName;
+    if (state.lastToolInput) session.lastToolInput = state.lastToolInput;
 
     session.lastActivity = getFileMtime(session.jsonlPath);
     const timeSince = Date.now() - session.lastActivity;
@@ -203,6 +218,24 @@ function pollSessionStatus() {
     if (!isProcessRunning(session.pid)) {
       markCompleted(sessionId);
       continue;
+    }
+
+    const latestJsonl = findLatestJsonlInProject(session.projectDir);
+    if (latestJsonl && latestJsonl !== session.jsonlPath) {
+      const latestMtime = getFileMtime(latestJsonl);
+      const currentMtime = session.jsonlPath ? getFileMtime(session.jsonlPath) : 0;
+      if (latestMtime > currentMtime) {
+        unwatchJsonl(sessionId);
+        session.jsonlPath = latestJsonl;
+        session.lastOffset = 0;
+        session.firstPrompt = '';
+        session.lastPrompt = '';
+        session.tokens = { totalInput: 0, totalOutput: 0 };
+        session.toolCallCount = 0;
+        session.model = null;
+        parseAndUpdate(sessionId);
+        watchJsonl(sessionId, latestJsonl);
+      }
     }
 
     if (session.jsonlPath) {
@@ -295,6 +328,29 @@ function findJsonlPath(projectDir, sessionId) {
   return null;
 }
 
+function findLatestJsonlInProject(projectDir) {
+  if (!projectDir) return null;
+  const dirPath = path.join(PROJECTS_DIR, projectDir);
+  try {
+    const files = fs.readdirSync(dirPath).filter(
+      (f) => f.endsWith('.jsonl') && !f.startsWith('agent-')
+    );
+    if (files.length === 0) return null;
+
+    let latest = null;
+    let latestMtime = 0;
+    for (const file of files) {
+      const fp = path.join(dirPath, file);
+      const mtime = fs.statSync(fp).mtimeMs;
+      if (mtime > latestMtime) {
+        latestMtime = mtime;
+        latest = fp;
+      }
+    }
+    return latest;
+  } catch { return null; }
+}
+
 function getFileMtime(filePath) {
   try { return fs.statSync(filePath).mtimeMs; }
   catch { return Date.now(); }
@@ -314,6 +370,9 @@ function toClientData(session) {
     projectDir: session.projectDir,
     projectLabel: session.projectLabel,
     status: session.status,
+    activityHint: session.lastRecordHint || null,
+    lastToolName: session.lastToolName || null,
+    lastToolInput: session.lastToolInput || null,
     startedAt: session.startedAt,
     firstPrompt: session.firstPrompt,
     lastPrompt: session.lastPrompt,

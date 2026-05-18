@@ -9,6 +9,30 @@ const STATUS = {
   completed: { label: '종료', color: 'var(--dm)' },
 };
 
+const HINT_LABEL = {
+  user_input: 'AI 응답 중',
+  tool_use: '도구 실행 중',
+  tool_pending: '승인 대기',
+  assistant_end: '응답 완료',
+  turn_ended: '입력 대기',
+};
+
+const HINT_STYLE = {
+  tool_pending: { color: 'var(--rd)', borderColor: 'rgba(239,68,68,.3)', background: 'rgba(239,68,68,.08)' },
+  user_input: { color: 'var(--gn)', borderColor: 'rgba(74,222,128,.3)', background: 'rgba(74,222,128,.08)' },
+};
+
+function resolveHint(session) {
+  if (!session.activityHint || session.status === 'completed') return null;
+  if (session.activityHint === 'tool_use') {
+    const secSince = (Date.now() - session.lastActivity) / 1000;
+    if (secSince <= 15) return 'tool_use';
+    if (secSince <= 600) return 'tool_pending';
+    return 'turn_ended';
+  }
+  return session.activityHint;
+}
+
 function formatDuration(startedAt) {
   const diff = Date.now() - new Date(startedAt).getTime();
   const minutes = Math.floor(diff / 60000);
@@ -44,7 +68,7 @@ export default function MonitorPage() {
   }, []);
 
   useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 30_000);
+    const id = setInterval(() => setTick((t) => t + 1), 10_000);
     return () => clearInterval(id);
   }, []);
 
@@ -253,7 +277,9 @@ function MonitorCell({ group, selectedId, onSelect }) {
 function MonitorCard({ session, isSelected, onClick }) {
   const st = STATUS[session.status] || STATUS.completed;
   const totalTokens = (session.tokens?.totalInput || 0) + (session.tokens?.totalOutput || 0);
-  const borderLeftColor = session.status === 'active' ? 'var(--gn)' :
+  const isPending = resolveHint(session) === 'tool_pending';
+  const borderLeftColor = isPending ? 'var(--rd)' :
+    session.status === 'active' ? 'var(--gn)' :
     session.status === 'idle' ? 'var(--yw)' : 'var(--dm)';
 
   return (
@@ -293,6 +319,22 @@ function MonitorCard({ session, isSelected, onClick }) {
         }}>
           {st.label}
         </span>
+        {(() => {
+          const hint = resolveHint(session);
+          if (!hint) return null;
+          const hs = HINT_STYLE[hint] || {};
+          return (
+            <span style={{
+              fontSize: 10, padding: '1px 7px', borderRadius: 'var(--rx)',
+              color: hs.color || 'var(--mt)',
+              background: hs.background || 'var(--bg)',
+              border: `1px solid ${hs.borderColor || 'var(--bd)'}`,
+              fontWeight: hint === 'tool_pending' ? 600 : 500,
+            }}>
+              {HINT_LABEL[hint] || hint}
+            </span>
+          );
+        })()}
         <span style={{
           fontSize: 10, color: 'var(--dm)', marginLeft: 'auto',
           fontFamily: "'JetBrains Mono', monospace",
@@ -300,6 +342,26 @@ function MonitorCard({ session, isSelected, onClick }) {
           {session._duration}
         </span>
       </div>
+
+      {resolveHint(session) === 'tool_pending' && (
+        <div style={{
+          fontSize: 12, padding: '8px 10px', marginBottom: 8,
+          borderRadius: 'var(--rs)', lineHeight: 1.5,
+          background: 'rgba(239,68,68,.06)', border: '1px solid rgba(239,68,68,.2)',
+        }}>
+          <div style={{ color: 'var(--rd)', fontWeight: 600, marginBottom: 3 }}>
+            승인 대기 — {session.lastToolName || '도구'}
+          </div>
+          {session.lastToolInput && (
+            <div style={{
+              color: 'var(--mt)', fontSize: 11, fontFamily: "'JetBrains Mono', monospace",
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>
+              {session.lastToolInput}
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{
         fontSize: 13, color: '#d4d4d8', lineHeight: 1.6, marginBottom: 8,
@@ -356,6 +418,23 @@ function MonitorDetail({ session }) {
           <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'currentColor' }} />
           {st.label}
         </span>
+        {(() => {
+          const hint = resolveHint(session);
+          if (!hint) return null;
+          const hs = HINT_STYLE[hint] || {};
+          return (
+            <span style={{
+              fontSize: 11, padding: '4px 12px', borderRadius: 'var(--rx)',
+              marginLeft: 8,
+              color: hs.color || 'var(--mt)',
+              background: hs.background || 'var(--s2)',
+              border: `1px solid ${hs.borderColor || 'var(--bd)'}`,
+              fontWeight: hint === 'tool_pending' ? 600 : 500,
+            }}>
+              {HINT_LABEL[hint] || hint}
+            </span>
+          );
+        })()}
       </div>
 
       <div style={{ fontSize: 17, fontWeight: 500, color: '#fafafa', lineHeight: 1.7, marginBottom: 24 }}>

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { execSync } from 'child_process';
 import { resolveProjectPath, extractProjectLabel, labelFromDirName } from '../utils/pathDecoder.js';
 import { readFirstTimestamp, parseSessionSummary } from './jsonlParser.js';
 import dayjs from 'dayjs';
@@ -192,11 +193,33 @@ function getActiveSessions() {
   return active;
 }
 
+const processNameCache = new Map();
+const PROCESS_CACHE_TTL = 30_000;
+
 export function isProcessRunning(pid) {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+
+  if (process.platform !== 'win32') return true;
+
+  const cached = processNameCache.get(pid);
+  if (cached && Date.now() - cached.ts < PROCESS_CACHE_TTL) {
+    return cached.alive;
+  }
+
+  let alive = false;
+  try {
+    const out = execSync(`tasklist /FI "PID eq ${Number(pid)}" /FO CSV /NH`, {
+      encoding: 'utf-8', timeout: 3000, windowsHide: true,
+    });
+    const lower = out.toLowerCase();
+    alive = lower.includes('node.exe') || lower.includes('claude');
+  } catch {
+    alive = false;
+  }
+  processNameCache.set(pid, { alive, ts: Date.now() });
+  return alive;
 }

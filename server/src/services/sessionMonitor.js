@@ -4,9 +4,10 @@ import chokidar from 'chokidar';
 import { SESSIONS_DIR, PROJECTS_DIR, projectCache, isProcessRunning, getProjects } from './projectScanner.js';
 import { parseSessionIncremental } from './jsonlParser.js';
 
-const IDLE_THRESHOLD_MS = 120_000;
-const POLL_INTERVAL_MS = 5_000;
+const IDLE_THRESHOLD_MS = 120_000;      // 2분: active ↔ idle 경계
+const POLL_INTERVAL_MS = 5_000;         // 5초마다 상태 폴링
 const DEBOUNCE_MS = 500;
+const ZOMBIE_SESSION_MS = 1_800_000;    // 30분: 프로세스 alive + 무활동 → completed
 
 const sseClients = new Set();
 const activeSessions = new Map();
@@ -53,12 +54,24 @@ async function handleSessionFile(filePath) {
   const { pid, sessionId, cwd, startedAt } = content;
   if (!pid || !sessionId) return;
 
-  if (!isProcessRunning(pid)) {
-    markCompleted(sessionId);
+  const pidAlive = isProcessRunning(pid);
+
+  const existing = activeSessions.get(sessionId);
+  if (existing) {
+    if (!pidAlive) {
+      markCompleted(sessionId);
+      return;
+    }
+    if (existing.status === 'completed') {
+      reactivateSession(existing, pid);
+    }
     return;
   }
 
-  if (activeSessions.has(sessionId)) return;
+  const pidAlreadyTracked = [...activeSessions.values()].some(s => s.pid === pid);
+  if (pidAlreadyTracked) return;
+
+  if (!pidAlive) return;
 
   let projectDir = findProjectDir(cwd);
   let jsonlPath = findJsonlPath(projectDir, sessionId);
@@ -68,15 +81,8 @@ async function handleSessionFile(filePath) {
     projectDir = parent;
   }
 
-  if (projectDir) {
-    const latestJsonl = findLatestJsonlInProject(projectDir);
-    if (latestJsonl) {
-      const latestMtime = getFileMtime(latestJsonl);
-      const currentMtime = jsonlPath ? getFileMtime(jsonlPath) : 0;
-      if (latestMtime > currentMtime) {
-        jsonlPath = latestJsonl;
-      }
-    }
+  if (!jsonlPath && projectDir) {
+    jsonlPath = findJsonlPath(projectDir, sessionId);
   }
 
   const project = projectDir ? projectCache.get(projectDir) : null;
@@ -126,6 +132,58 @@ function markCompleted(sessionId) {
   session.status = 'completed';
   unwatchJsonl(sessionId);
   broadcast('update', toClientData(session));
+}
+
+function reactivateSession(session, newPid) {
+  if (newPid) session.pid = newPid;
+  session.status = 'active';
+  session.lastActivity = session.jsonlPath
+    ? getFileMtime(session.jsonlPath)
+    : Date.now();
+
+  if (session.jsonlPath && !jsonlWatchers.has(session.sessionId)) {
+    watchJsonl(session.sessionId, session.jsonlPath);
+    parseAndUpdate(session.sessionId);
+  }
+
+  broadcast('update', toClientData(session));
+}
+
+function tryUpgradeJsonl(sessionId, session) {
+  if (!session.projectDir) return false;
+
+  const latestJsonl = findLatestJsonlInProject(session.projectDir);
+  if (!latestJsonl || latestJsonl === session.jsonlPath) return false;
+
+  const latestMtime = getFileMtime(latestJsonl);
+  const currentMtime = session.jsonlPath ? getFileMtime(session.jsonlPath) : 0;
+  if (latestMtime <= currentMtime) return false;
+
+  const latestSessionId = path.basename(latestJsonl, '.jsonl');
+  const alreadyTracked = [...activeSessions.entries()].some(
+    ([id, s]) => id !== sessionId && s.jsonlPath === latestJsonl
+  );
+  if (alreadyTracked) return false;
+
+  unwatchJsonl(sessionId);
+  activeSessions.delete(sessionId);
+
+  session.sessionId = latestSessionId;
+  session.jsonlPath = latestJsonl;
+  session.lastOffset = 0;
+  session.firstPrompt = '';
+  session.lastPrompt = '';
+  session.tokens = { totalInput: 0, totalOutput: 0 };
+  session.toolCallCount = 0;
+  session.model = null;
+  session.lastRecordHint = null;
+  session.lastToolName = null;
+  session.lastToolInput = null;
+
+  activeSessions.set(latestSessionId, session);
+  parseAndUpdate(latestSessionId);
+  watchJsonl(latestSessionId, latestJsonl);
+  return true;
 }
 
 function watchJsonl(sessionId, jsonlPath) {
@@ -213,29 +271,44 @@ function pollSessionStatus() {
   rescanSessionFiles();
 
   for (const [sessionId, session] of activeSessions) {
-    if (session.status === 'completed') continue;
+    const pidAlive = isProcessRunning(session.pid);
+    const lastAct = session.jsonlPath ? getFileMtime(session.jsonlPath) : session.lastActivity;
+    const timeSinceActivity = now - lastAct;
 
-    if (!isProcessRunning(session.pid)) {
+    if (session.status === 'completed') {
+      if (pidAlive && tryUpgradeJsonl(sessionId, session)) {
+        reactivateSession(session);
+      } else if (pidAlive && session.jsonlPath) {
+        const newMtime = getFileMtime(session.jsonlPath);
+        if (newMtime > session.lastActivity) {
+          reactivateSession(session);
+        }
+      }
+      continue;
+    }
+
+    if (!pidAlive) {
       markCompleted(sessionId);
       continue;
     }
 
-    const latestJsonl = findLatestJsonlInProject(session.projectDir);
-    if (latestJsonl && latestJsonl !== session.jsonlPath) {
-      const latestMtime = getFileMtime(latestJsonl);
-      const currentMtime = session.jsonlPath ? getFileMtime(session.jsonlPath) : 0;
-      if (latestMtime > currentMtime) {
-        unwatchJsonl(sessionId);
-        session.jsonlPath = latestJsonl;
-        session.lastOffset = 0;
-        session.firstPrompt = '';
-        session.lastPrompt = '';
-        session.tokens = { totalInput: 0, totalOutput: 0 };
-        session.toolCallCount = 0;
-        session.model = null;
-        parseAndUpdate(sessionId);
-        watchJsonl(sessionId, latestJsonl);
+    const sessionFile = path.join(SESSIONS_DIR, `${session.pid}.json`);
+    const sessionFileExists = fs.existsSync(sessionFile);
+    if (!sessionFileExists && timeSinceActivity > IDLE_THRESHOLD_MS) {
+      markCompleted(sessionId);
+      continue;
+    }
+
+    if (sessionFileExists && timeSinceActivity > ZOMBIE_SESSION_MS) {
+      const sessionFileMtime = getFileMtime(sessionFile);
+      if (now - sessionFileMtime > ZOMBIE_SESSION_MS) {
+        markCompleted(sessionId);
+        continue;
       }
+    }
+
+    if (timeSinceActivity > IDLE_THRESHOLD_MS) {
+      tryUpgradeJsonl(sessionId, session);
     }
 
     if (session.jsonlPath) {
@@ -245,10 +318,8 @@ function pollSessionStatus() {
       }
     }
 
-    const lastAct = session.jsonlPath ? getFileMtime(session.jsonlPath) : session.lastActivity;
-    const timeSinceActivity = now - lastAct;
-    const newStatus = timeSinceActivity > IDLE_THRESHOLD_MS ? 'idle' : 'active';
-
+    const recalcAct = session.jsonlPath ? getFileMtime(session.jsonlPath) : session.lastActivity;
+    const newStatus = (now - recalcAct) > IDLE_THRESHOLD_MS ? 'idle' : 'active';
     if (session.status !== newStatus) {
       session.status = newStatus;
       broadcast('update', toClientData(session));

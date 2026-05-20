@@ -12,6 +12,7 @@ const STATUS = {
 const HINT_LABEL = {
   user_input: 'AI 응답 중',
   tool_use: '도구 실행 중',
+  tool_result: 'AI 처리 중',
   tool_pending: '승인 대기',
   assistant_end: '응답 완료',
   turn_ended: '입력 대기',
@@ -20,13 +21,15 @@ const HINT_LABEL = {
 const HINT_STYLE = {
   tool_pending: { color: 'var(--rd)', borderColor: 'rgba(239,68,68,.3)', background: 'rgba(239,68,68,.08)' },
   user_input: { color: 'var(--gn)', borderColor: 'rgba(74,222,128,.3)', background: 'rgba(74,222,128,.08)' },
+  tool_result: { color: 'var(--gn)', borderColor: 'rgba(74,222,128,.3)', background: 'rgba(74,222,128,.08)' },
 };
 
 function resolveHint(session) {
   if (!session.activityHint || session.status === 'completed') return null;
+  if (session.activityHint === 'tool_result') return 'tool_result';
   if (session.activityHint === 'tool_use') {
     const secSince = (Date.now() - session.lastActivity) / 1000;
-    if (secSince <= 15) return 'tool_use';
+    if (secSince <= 60) return 'tool_use';
     if (secSince <= 600) return 'tool_pending';
     return 'turn_ended';
   }

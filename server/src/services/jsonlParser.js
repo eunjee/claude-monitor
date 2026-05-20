@@ -215,7 +215,9 @@ function processRecordLive(record, state) {
 
   if (record.type === 'user' && !record.isMeta) {
     processUserRecord(record, state);
-    state.lastRecordHint = 'user_input';
+    const hasToolResult = Array.isArray(record.message?.content)
+      && record.message.content.some(b => b.type === 'tool_result');
+    state.lastRecordHint = hasToolResult ? 'tool_result' : 'user_input';
   } else if (record.type === 'assistant') {
     const msg = record.message;
     if (!msg) return;

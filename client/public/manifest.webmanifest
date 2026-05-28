@@ -1,0 +1,19 @@
+{
+  "name": "Claude Session Dashboard",
+  "short_name": "세션 모니터",
+  "description": "Claude Code 세션 실시간 모니터링 위젯",
+  "start_url": "/widget",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f9fafb",
+  "theme_color": "#3b82f6",
+  "icons": [
+    {
+      "src": "/pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

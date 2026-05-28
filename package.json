@@ -6,9 +6,12 @@
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
     "dev:server": "cd server && node --watch src/index.js",
     "dev:client": "cd client && npm run dev",
+    "build:client": "cd client && npm run build",
+    "widget": "npm run build:client && electron electron/main.js",
     "install:all": "npm install && cd server && npm install && cd ../client && npm install"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2"
+    "concurrently": "^9.1.2",
+    "electron": "^33.2.1"
   }
 }
